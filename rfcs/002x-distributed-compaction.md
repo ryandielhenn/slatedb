@@ -198,7 +198,7 @@ Extend the `Compaction` table in `compactor.fbs`:
 
 ```fbs
 table WorkerSpec {
-    worker_id: string;          // empty = unclaimed
+    worker_id: string;          // worker_id of worker that owns compaction
     last_heartbeat_ms: uint64;  // wall-clock ms of last progress write
 }
 
@@ -210,12 +210,9 @@ table Compaction {
     output_ssts: [CompactedSsTable];
 
     // NEW
-    worker: WorkerSpec;
+    worker: WorkerSpec; // null = unclaimed compaction
 }
 ```
-
-Both fields are optional (default: `""`, `0`); existing `.compactions` files require no migration.
-
 ### Work Claim Protocol
 
 Workers use optimistic concurrency on `.compactions`. SlateDB implements this uniformly across all object stores, including those with native CAS support, using create-if-not-exists on sequentially-numbered files (e.g. `00000000000000000003.compactions`). Writing a new version means writing the next numbered file; if another writer got there first the write fails with `AlreadyExists` and the worker retries. See [RFC-0001](0001-manifest.md) for the full protocol.
