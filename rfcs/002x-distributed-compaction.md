@@ -39,6 +39,9 @@ Table of Contents:
    * [Status quo (single compactor)](#status-quo-single-compactor)
    * [Peer-to-peer leader election via object store](#peer-to-peer-leader-election-via-object-store)
    * [chitchat for work distribution/discovery](#chitchat-for-work-distributiondiscovery)
+- [Future Work](#future-work)
+   * [Compaction routing](#compaction-routing)
+   * [Multi-DB workers](#multi-db-workers)
 - [Open Questions](#open-questions)
 - [References](#references)
 - [Updates](#updates)
@@ -76,7 +79,6 @@ The design in this RFC sidesteps this complexity by separating coordination (sch
 - **Changing the compaction scheduling strategy.** The scheduler logic is unchanged; only execution is distributed.
 - **Multi-coordinator support.** The single-coordinator invariant is preserved; leader election across coordinators or purely distributed coordination is a future concern.
 - **Changes to the public read/write API.** Distributed compaction is transparent to DB clients.
-- **Compaction routing.** Routing compactions to specific workers or worker classes (e.g. L0 jobs to an embedded worker, major compactions to a beefy short-lived node) is out of scope. The claim protocol is designed so that selectivity can be added entirely on the worker side without coordinator or schema changes.
 
 ## Design
 
@@ -505,6 +507,24 @@ All compactors are peers; optimistic concurrency on a numbered file elects a lea
 
 Use gossip to distribute jobs directly.
 **Rejected:** couples correctness to gossip consistency; chitchat is better as an optional discovery/health layer.
+
+## Future Work
+
+### Compaction routing
+
+Routing compactions to specific workers or worker classes (e.g. L0 jobs to an embedded worker, major compactions to a beefy short-lived node). The claim protocol in this RFC is designed so that selectivity can be added entirely on the worker side without coordinator or schema changes: a worker can filter `Submitted` entries by `CompactionSpec` properties (level, input bytes, etc.) before attempting a claim. Common shapes worth exploring:
+
+- **L0 affinity:** embedded workers preferentially claim L0 jobs to keep flush-side latency low; remote workers handle larger compactions.
+- **Size-class pools:** small jobs go to long-lived workers; large major compactions go to a separate pool of beefy short-lived nodes that can scale to zero between jobs.
+
+### Multi-DB workers
+
+Some SlateDB users run thousands of DBs. A single worker process today is bound to one DB via its `CompactionWorkerBuilder` path/object-store pair. A natural extension is a multi-DB worker that polls `.compactions` across many DBs from a shared pool, sharing CPU, network, and process overhead across them. Open design questions:
+
+- **Discovery:** how does a worker learn the set of DBs to service (static config, prefix scan, control-plane registry)?
+- **Fairness and prioritization:** how is poll budget and concurrency allocated across DBs so a hot DB doesn't starve quiet ones?
+- **Resource isolation:** per-DB bytes-in-flight and concurrency caps so one DB's major compaction can't exhaust the worker.
+- **Identity and metrics:** worker IDs and metric labels likely need a `{db, worker_id}` shape rather than just `{worker_id}`.
 
 ## Open Questions
 
