@@ -166,7 +166,7 @@ pub struct CompactionWorkerOptions {
 
 - `poll_interval_ms` is used for polling frequency. Each poll sleeps for `poll_interval_ms + random(0, poll_interval_ms * 0.1)` to prevent workers from synchronizing on `.compactions` reads. This jitter is applied on every poll and requires no configuration.
 
-- `heartbeat_bytes` is used to tie heartbeats to compaction progress and gives the coordinator a minimum throughput guarantee. A worker that falls behind this rate will be reclaimed and its job handed off, regardless of whether its event loop is still alive.
+- `heartbeat_bytes` is used to tie heartbeats to compaction progress and gives the coordinator a liveness guarantee. A worker that falls behind this rate will be reclaimed and its job handed off, regardless of whether its event loop is still alive.
 
 - `heartbeat_min_interval_ms` suppresses heartbeats triggered by `heartbeat_bytes` when processing is fast and should be set well below the coordinator's `worker_heartbeat_timeout_ms`.
 
