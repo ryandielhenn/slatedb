@@ -1151,8 +1151,6 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             self.system_clock,
             self.closed_result,
             self.merge_operator,
-            #[cfg(feature = "compaction_filters")]
-            self.compaction_filter_supplier,
         )
     }
 
