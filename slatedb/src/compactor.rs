@@ -67,8 +67,6 @@ use tokio::runtime::Handle;
 use tracing::instrument;
 use ulid::Ulid;
 
-#[cfg(feature = "compaction_filters")]
-use crate::compaction_filter::CompactionFilterSupplier;
 use crate::compactions_store::{CompactionsStore, StoredCompactions};
 use crate::compactor::stats::CompactionStats;
 use crate::compactor_executor::{CompactionExecutor, StartCompactionJobArgs};
@@ -330,8 +328,6 @@ pub struct Compactor {
     stats: Arc<CompactionStats>,
     system_clock: Arc<dyn SystemClock>,
     merge_operator: Option<MergeOperatorType>,
-    #[cfg(feature = "compaction_filters")]
-    compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
 }
 
 impl Compactor {
@@ -348,9 +344,6 @@ impl Compactor {
         system_clock: Arc<dyn SystemClock>,
         closed_result: Arc<dyn ClosedResultWriter>,
         merge_operator: Option<MergeOperatorType>,
-        #[cfg(feature = "compaction_filters")] compaction_filter_supplier: Option<
-            Arc<dyn CompactionFilterSupplier>,
-        >,
     ) -> Self {
         let stats = Arc::new(CompactionStats::new(recorder));
         let task_executor = Arc::new(MessageHandlerExecutor::new(
@@ -369,8 +362,6 @@ impl Compactor {
             stats,
             system_clock,
             merge_operator,
-            #[cfg(feature = "compaction_filters")]
-            compaction_filter_supplier,
         }
     }
 
