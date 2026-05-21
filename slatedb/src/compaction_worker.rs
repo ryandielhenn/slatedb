@@ -588,7 +588,17 @@ impl MessageHandler<CompactorMessage> for CompactionWorkerHandler {
         // Stop accepting new work, then release any active claims so other
         // workers can pick them up immediately rather than waiting for the
         // heartbeat-timeout reclamation path.
-        self.executor.stop();
+        //
+        // `TokioCompactionExecutor::stop` internally uses `handle.block_on`,
+        // which panics when called from within an async runtime. Mirror the
+        // coordinator's `stop_executor` pattern (see compactor.rs) and run it
+        // off-runtime.
+        let executor = self.executor.clone();
+        #[cfg(not(dst))]
+        #[allow(clippy::disallowed_methods)]
+        let _ = tokio::task::spawn_blocking(move || executor.stop()).await;
+        #[cfg(dst)]
+        let _ = tokio::spawn(async move { executor.stop() }).await;
         let claimed: Vec<Ulid> = self.active_jobs.drain().collect();
         for id in claimed {
             if let Err(e) = self.release_claim(id).await {
