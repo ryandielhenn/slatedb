@@ -23,6 +23,8 @@ use object_store::ObjectStore;
 use tokio::runtime::Handle;
 use ulid::Ulid;
 
+#[cfg(feature = "compaction_filters")]
+use crate::compaction_filter::CompactionFilterSupplier;
 use crate::compactions_store::{CompactionsStore, StoredCompactions};
 use crate::compactor::stats::CompactionStats;
 use crate::compactor::CompactorMessage;
@@ -65,6 +67,8 @@ pub struct CompactionWorker {
     stats: Arc<CompactionStats>,
     system_clock: Arc<dyn SystemClock>,
     merge_operator: Option<MergeOperatorType>,
+    #[cfg(feature = "compaction_filters")]
+    compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
 }
 
 impl CompactionWorker {
@@ -125,7 +129,7 @@ impl CompactionWorker {
                 manifest_store: self.manifest_store.clone(),
                 merge_operator: self.merge_operator.clone(),
                 #[cfg(feature = "compaction_filters")]
-                compaction_filter_supplier: None,
+                compaction_filter_supplier: self.compaction_filter_supplier.clone(),
             },
         ));
 
@@ -162,6 +166,8 @@ pub struct CompactionWorkerBuilder<P: Into<Path>> {
     recorder: MetricsRecorderHelper,
     system_clock: Arc<dyn SystemClock>,
     merge_operator: Option<MergeOperatorType>,
+    #[cfg(feature = "compaction_filters")]
+    compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
 }
 
 impl<P: Into<Path>> CompactionWorkerBuilder<P> {
@@ -175,6 +181,8 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
             recorder: MetricsRecorderHelper::noop(),
             system_clock: Arc::new(DefaultSystemClock::default()),
             merge_operator: None,
+            #[cfg(feature = "compaction_filters")]
+            compaction_filter_supplier: None,
         }
     }
 
@@ -208,6 +216,15 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
         self
     }
 
+    #[cfg(feature = "compaction_filters")]
+    pub fn with_compaction_filter_supplier(
+        mut self,
+        supplier: Arc<dyn CompactionFilterSupplier>,
+    ) -> Self {
+        self.compaction_filter_supplier = Some(supplier);
+        self
+    }
+
     pub async fn build(self) -> Result<CompactionWorker, crate::Error> {
         let path: Path = self.path.into();
         let manifest_store = Arc::new(ManifestStore::new(&path, self.main_object_store.clone()));
@@ -236,6 +253,8 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
             stats,
             system_clock: self.system_clock,
             merge_operator: self.merge_operator,
+            #[cfg(feature = "compaction_filters")]
+            compaction_filter_supplier: self.compaction_filter_supplier,
         })
     }
 }
@@ -630,6 +649,9 @@ pub(crate) fn build_embedded_worker(
     stats: Arc<CompactionStats>,
     system_clock: Arc<dyn SystemClock>,
     merge_operator: Option<MergeOperatorType>,
+    #[cfg(feature = "compaction_filters")] compaction_filter_supplier: Option<
+        Arc<dyn CompactionFilterSupplier>,
+    >,
 ) -> CompactionWorker {
     // The embedded worker shares the coordinator's `MessageHandlerExecutor`,
     // so the local one constructed here is unused — kept only so the
@@ -650,6 +672,8 @@ pub(crate) fn build_embedded_worker(
         stats,
         system_clock,
         merge_operator,
+        #[cfg(feature = "compaction_filters")]
+        compaction_filter_supplier,
     }
 }
 
