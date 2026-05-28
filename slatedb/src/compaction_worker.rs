@@ -754,7 +754,7 @@ mod tests {
                 SST_FORMAT_VERSION_LATEST,
                 sst_info,
             ));
-            core.tree.l0.push_back(l0_view.clone());
+            Arc::make_mut(&mut core.tree).l0.push_back(l0_view.clone());
             StoredManifest::create_new_db(manifest_store.clone(), core, clock.clone())
                 .await
                 .unwrap();
