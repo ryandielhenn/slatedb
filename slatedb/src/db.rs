@@ -2257,7 +2257,8 @@ mod tests {
             .with_settings(test_db_options(0, 1024, None))
             .with_compactor_builder(
                 CompactorBuilder::new(path, object_store.clone())
-                    .with_scheduler_supplier(compaction_scheduler),
+                    .with_scheduler_supplier(compaction_scheduler)
+                    .with_options(fast_compactor_options()),
             )
             .build()
             .await
@@ -2785,7 +2786,8 @@ mod tests {
             .with_settings(test_db_options(0, 64 * 1024, None))
             .with_compactor_builder(
                 CompactorBuilder::new(path, object_store.clone())
-                    .with_scheduler_supplier(scheduler),
+                    .with_scheduler_supplier(scheduler)
+                    .with_options(fast_compactor_options()),
             )
             .build()
             .await
@@ -5502,7 +5504,8 @@ mod tests {
             .with_merge_operator(Arc::new(StringConcatMergeOperator {}))
             .with_compactor_builder(
                 CompactorBuilder::new(path, object_store.clone())
-                    .with_scheduler_supplier(compaction_scheduler.clone()),
+                    .with_scheduler_supplier(compaction_scheduler.clone())
+                    .with_options(fast_compactor_options()),
             )
             .build()
             .await
@@ -7041,6 +7044,21 @@ mod tests {
         compactor_options: Option<CompactorOptions>,
     ) -> Settings {
         test_db_options_with_ttl(min_filter_keys, l0_sst_size_bytes, compactor_options, None)
+    }
+
+    /// Compactor options with fast poll intervals. With the defaults (5s
+    /// coordinator poll + 5s worker claim poll, jittered up to 1.5x), a
+    /// compaction can take longer to land in the manifest than the 10s the
+    /// tests using this helper wait for one.
+    fn fast_compactor_options() -> CompactorOptions {
+        CompactorOptions {
+            poll_interval: Duration::from_millis(100),
+            worker: Some(CompactionWorkerOptions {
+                compactions_poll_interval: Duration::from_millis(100),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
     }
 
     fn test_db_options_with_ttl(
