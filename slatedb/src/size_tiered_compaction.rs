@@ -50,6 +50,10 @@ impl ConflictChecker {
         true
     }
 
+    fn contains(&self, source: &SourceId) -> bool {
+        self.sources_used.contains(source)
+    }
+
     fn add_compaction(&mut self, compaction: &CompactionSpec) {
         for source in compaction.sources().iter() {
             self.sources_used.insert(*source);
@@ -333,8 +337,19 @@ impl SizeTieredCompactionScheduler {
         tree: &TreeState,
         next_fresh_sr_id: &mut u32,
     ) -> Option<CompactionSpec> {
-        // compact l0s if required
-        let l0_candidates: VecDeque<_> = tree.l0.iter().copied().collect();
+        // compact l0s if required. L0s held by an in-flight (or just-picked)
+        // compaction occupy the oldest end of the queue; only L0s strictly
+        // newer than the newest held L0 are candidates. This pipelines L0
+        // compactions as disjoint contiguous chunks: each new chunk sits
+        // directly above the in-flight ones, and the coordinator commits
+        // chunks oldest-first so the segment's single L0 watermark only ever
+        // advances over absorbed L0s (RFC-0025).
+        let newest_held_idx = tree
+            .l0
+            .iter()
+            .position(|src| tree.conflicts.contains(&src.source))
+            .unwrap_or(tree.l0.len());
+        let l0_candidates: VecDeque<_> = tree.l0[..newest_held_idx].iter().copied().collect();
         if let Some(mut l0_candidates) = self.clamp_min(l0_candidates) {
             l0_candidates = self.clamp_max(l0_candidates);
             // SR ids are globally unique (RFC-0024), so the fresh-id counter
@@ -692,6 +707,71 @@ mod tests {
 
         // then:
         assert_eq!(requests.len(), 0);
+    }
+
+    /// With an L0 chunk in flight, the scheduler proposes the next chunk over
+    /// the L0s strictly newer than the in-flight chunk's, with a fresh
+    /// destination above the in-flight one (RFC-0025 pipelined L0 chunks).
+    #[test]
+    fn test_should_propose_pipelined_l0_chunk_above_in_flight_chunk() {
+        // given: 8 L0s, the 4 oldest already compacting to SR 0.
+        let scheduler = SizeTieredCompactionScheduler::default();
+        let l0: Vec<SsTableView> = (0..8).map(|_| create_sst_view(1)).collect();
+        let mut state =
+            create_compactor_state(create_db_state(l0.iter().cloned().collect(), vec![]));
+        let rand = Arc::new(DbRand::default());
+        let system_clock = Arc::new(DefaultSystemClock::new());
+
+        let compaction_id = rand.rng().gen_ulid(system_clock.as_ref());
+        let in_flight = create_l0_compaction(&l0[4..8], 0);
+        state
+            .add_compaction(Compaction::new(compaction_id, in_flight))
+            .expect("failed to add job");
+
+        // when:
+        let requests = scheduler.propose(&(&state).into());
+
+        // then: one chunk over the 4 newest L0s, destination above the
+        // in-flight chunk's.
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0], create_l0_compaction(&l0[0..4], 1));
+    }
+
+    /// L0s older than (or interleaved with) an in-flight chunk's are never
+    /// proposed: a chunk below the in-flight suffix could not commit without
+    /// regressing the watermark, and the hole left by a failed chunk must not
+    /// be re-proposed while newer chunks are still in flight (their
+    /// destination ids would not follow recency).
+    #[test]
+    fn test_should_not_propose_l0s_older_than_in_flight_chunk() {
+        // given: 8 L0s where the *middle* 4 are compacting (a hole below them
+        // — e.g. after an older chunk failed). Only 2 L0s sit above the
+        // in-flight chunk, fewer than min_compaction_sources.
+        let scheduler = SizeTieredCompactionScheduler::new(
+            SizeTieredCompactionSchedulerOptions {
+                min_compaction_sources: 3,
+                ..SizeTieredCompactionSchedulerOptions::default()
+            },
+            DEFAULT_MAX_CONCURRENT_COMPACTIONS,
+        );
+        let l0: Vec<SsTableView> = (0..8).map(|_| create_sst_view(1)).collect();
+        let mut state =
+            create_compactor_state(create_db_state(l0.iter().cloned().collect(), vec![]));
+        let rand = Arc::new(DbRand::default());
+        let system_clock = Arc::new(DefaultSystemClock::new());
+
+        let compaction_id = rand.rng().gen_ulid(system_clock.as_ref());
+        let in_flight = create_l0_compaction(&l0[2..6], 0);
+        state
+            .add_compaction(Compaction::new(compaction_id, in_flight))
+            .expect("failed to add job");
+
+        // when:
+        let requests = scheduler.propose(&(&state).into());
+
+        // then: the 2 L0s above the in-flight chunk are below the minimum,
+        // and the 2 below it must not be proposed.
+        assert!(requests.is_empty(), "got {:?}", requests);
     }
 
     #[test]

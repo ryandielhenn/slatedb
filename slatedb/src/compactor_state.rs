@@ -766,7 +766,13 @@ impl CompactorState {
                     v.insert(compaction.clone());
                 }
                 Entry::Occupied(mut o) => {
-                    let adopt = matches!(compaction.status(), CompactionStatus::Compacted)
+                    // A remote `Compacted` is only adopted while the local
+                    // entry is still active: once the coordinator has decided
+                    // a terminal state (e.g. cascading an L0 chunk failure,
+                    // RFC-0025), a still-running worker's late result must
+                    // not resurrect the entry.
+                    let adopt = (matches!(compaction.status(), CompactionStatus::Compacted)
+                        && o.get().status().active())
                         || (matches!(o.get().status(), CompactionStatus::Scheduled)
                             && matches!(compaction.status(), CompactionStatus::Running))
                         || (matches!(o.get().status(), CompactionStatus::Running)

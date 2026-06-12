@@ -54,7 +54,7 @@
 //! represents a description (Spec), a durable decision (Compaction), or a running
 //! attempt (JobSpec).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -538,6 +538,21 @@ impl MessageHandler<CompactorMessage> for CompactorEventHandler {
     }
 }
 
+/// Whether a `Compacted` entry may be committed to the manifest right now.
+/// See [`CompactorEventHandler::commit_readiness`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitReadiness {
+    /// Every L0 older than the entry's newest L0 source is absorbed or among
+    /// the entry's own sources; the commit may proceed.
+    Ready,
+    /// An older L0 is still held by another in-flight compaction; wait for
+    /// the older chunk to commit first.
+    Blocked,
+    /// An older L0 is held by no in-flight compaction; the entry can never
+    /// commit and must be failed.
+    Wedged,
+}
+
 impl CompactorEventHandler {
     pub(crate) async fn new(
         manifest_store: Arc<ManifestStore>,
@@ -711,47 +726,95 @@ impl CompactorEventHandler {
     ///   already in the correct post-compaction state, so marking `Failed` has no
     ///   effect on correctness.
     async fn commit_compacted_entries(&mut self) -> Result<(), SlateDBError> {
-        let compacted = self
+        let mut pending = self
             .state()
             .compactions_with_status(&[CompactionStatus::Compacted])
             .cloned()
             .collect::<Vec<_>>();
 
-        if compacted.is_empty() {
+        if pending.is_empty() {
             return Ok(());
         }
 
-        for compaction in compacted {
-            let id = compaction.id();
-            match self.validate_compaction(compaction.spec()) {
-                Ok(()) => {
-                    let destination = compaction
-                        .spec()
-                        .destination()
-                        .expect("Compacted tiered compaction must have a destination SR id");
-                    let output_sr = SortedRun {
-                        id: destination,
-                        sst_views: compaction
-                            .output_ssts()
-                            .iter()
-                            .map(|sst| SsTableView::identity(sst.clone()))
-                            .collect(),
-                    };
-                    self.state_mut().finish_compaction(id, output_sr);
-                    self.stats
-                        .last_compaction_ts
-                        .set(self.system_clock.now().timestamp());
+        // Commit L0-bearing entries oldest-chunk-first: the segment's L0
+        // watermark is a single scalar meaning "this L0 and everything older
+        // is absorbed", so a chunk may only commit once every older L0 in its
+        // segment is gone. Entries that completed out of order wait in
+        // `Compacted` until their older sibling commits; looping to a fixpoint
+        // lets a chain of chunks commit within a single tick.
+        loop {
+            let mut progressed = false;
+            let mut blocked = Vec::new();
+            for compaction in pending {
+                let id = compaction.id();
+                // Skip entries a cascade failed earlier in this loop.
+                let current_status = self
+                    .state()
+                    .compactions()
+                    .value
+                    .get(&id)
+                    .map(|c| c.status());
+                if current_status != Some(CompactionStatus::Compacted) {
+                    continue;
                 }
-                Err(_) => {
-                    // Validation failed against the current manifest. Mark Failed so the
-                    // entry isn't retried on the next tick.
-                    info!(
-                        "compacted entry failed validation, marking Failed [id={}]",
-                        id
-                    );
-                    self.state_mut()
-                        .update_compaction(&id, |c| c.set_status(CompactionStatus::Failed));
+                match self.commit_readiness(compaction.spec()) {
+                    CommitReadiness::Blocked => {
+                        debug!(
+                            "compacted entry waits for older L0s to be absorbed [compaction={}]",
+                            compaction
+                        );
+                        blocked.push(compaction);
+                        continue;
+                    }
+                    CommitReadiness::Wedged => {
+                        // Some older L0 is neither absorbed nor claimed by any
+                        // in-flight compaction (e.g. its compaction failed), so
+                        // this entry can never legally advance the watermark.
+                        warn!(
+                            "compacted entry can never commit: an older L0 has no in-flight \
+                             compaction; marking Failed [compaction={}]",
+                            compaction
+                        );
+                        self.fail_compaction_cascading(id);
+                        progressed = true;
+                        continue;
+                    }
+                    CommitReadiness::Ready => {}
                 }
+                progressed = true;
+                match self.validate_compaction(compaction.spec()) {
+                    Ok(()) => {
+                        let destination = compaction
+                            .spec()
+                            .destination()
+                            .expect("Compacted tiered compaction must have a destination SR id");
+                        let output_sr = SortedRun {
+                            id: destination,
+                            sst_views: compaction
+                                .output_ssts()
+                                .iter()
+                                .map(|sst| SsTableView::identity(sst.clone()))
+                                .collect(),
+                        };
+                        self.state_mut().finish_compaction(id, output_sr);
+                        self.stats
+                            .last_compaction_ts
+                            .set(self.system_clock.now().timestamp());
+                    }
+                    Err(_) => {
+                        // Validation failed against the current manifest. Mark Failed so the
+                        // entry isn't retried on the next tick.
+                        info!(
+                            "compacted entry failed validation, marking Failed [id={}]",
+                            id
+                        );
+                        self.fail_compaction_cascading(id);
+                    }
+                }
+            }
+            pending = blocked;
+            if !progressed || pending.is_empty() {
+                break;
             }
         }
 
@@ -759,6 +822,164 @@ impl CompactorEventHandler {
         self.state_writer.write_state_safely().await?;
 
         Ok(())
+    }
+
+    /// Determines whether a `Compacted` entry may be committed to the manifest
+    /// right now (see [`Self::commit_compacted_entries`]).
+    ///
+    /// Entries without L0 sources (SR-to-SR merges) never move the watermark
+    /// and are always [`CommitReadiness::Ready`]. For L0-bearing specs, every
+    /// L0 in the target tree that is older than the spec's newest L0 source
+    /// must either be among the spec's own sources or already absorbed:
+    ///
+    /// - All older L0s covered → `Ready`.
+    /// - An uncovered older L0 is held by another active compaction →
+    ///   `Blocked`: wait for the older chunk to commit first.
+    /// - An uncovered older L0 is held by nothing → `Wedged`: no in-flight
+    ///   compaction will ever absorb it, so the entry can never commit.
+    ///
+    /// Specs whose sources are missing from the tree fall through as `Ready`
+    /// so that `validate_compaction` produces the existing recovery behavior:
+    /// the sources were already absorbed (e.g. the manifest write landed
+    /// before a coordinator crash), and the entry is marked `Failed`.
+    fn commit_readiness(&self, spec: &CompactionSpec) -> CommitReadiness {
+        if !spec.has_l0_sources() {
+            return CommitReadiness::Ready;
+        }
+        let Some(tree) = self.state().db_state().tree_for_segment(spec.segment()) else {
+            return CommitReadiness::Ready;
+        };
+        let spec_l0s: HashSet<Ulid> = spec
+            .sources()
+            .iter()
+            .filter_map(|s| s.maybe_unwrap_sst_view())
+            .collect();
+        let Some(spec_newest) = tree.l0.iter().position(|view| spec_l0s.contains(&view.id)) else {
+            return CommitReadiness::Ready;
+        };
+        let uncovered: Vec<Ulid> = tree
+            .l0
+            .iter()
+            .skip(spec_newest)
+            .filter(|view| !spec_l0s.contains(&view.id))
+            .map(|view| view.id)
+            .collect();
+        if uncovered.is_empty() {
+            return CommitReadiness::Ready;
+        }
+        let held: HashSet<Ulid> = self
+            .state()
+            .compactions_with_status(&[
+                CompactionStatus::Submitted,
+                CompactionStatus::Scheduled,
+                CompactionStatus::Running,
+                CompactionStatus::Compacted,
+            ])
+            .filter(|c| c.spec().segment() == spec.segment() && c.spec() != spec)
+            .flat_map(|c| c.spec().sources().iter())
+            .filter_map(|s| s.maybe_unwrap_sst_view())
+            .collect();
+        if uncovered.iter().all(|id| held.contains(id)) {
+            CommitReadiness::Blocked
+        } else {
+            CommitReadiness::Wedged
+        }
+    }
+
+    /// Marks a compaction `Failed` and, if its L0 sources are still live in
+    /// the target tree, also fails every in-flight compaction in the same
+    /// segment whose L0 block is newer.
+    ///
+    /// A failed L0 chunk leaves a hole in the L0 queue: chunks above the hole
+    /// can never commit (the watermark must advance contiguously), and the
+    /// hole cannot be re-proposed with a destination SR id below the newer
+    /// chunks' (fresh ids are always allocated above in-flight ones, which
+    /// would break the recency ordering of the tree's `compacted` list).
+    /// Failing the newer chunks unwedges the segment: the scheduler re-proposes
+    /// the whole range from the oldest L0 with fresh, correctly-ordered
+    /// destinations. The wasted work is bounded by the in-flight chunks and
+    /// failures here are rare (validation failures, not worker crashes —
+    /// crashed workers release or are reclaimed with their spec intact).
+    ///
+    /// If the failed spec's L0 sources are absent from the tree the failure is
+    /// the recovery case (the manifest write already landed before a crash);
+    /// the newer chunks remain committable and no cascade happens. Worker
+    /// claims on cascaded entries are cleared so a still-running worker's
+    /// late result write is rejected by its ownership check.
+    fn fail_compaction_cascading(&mut self, id: Ulid) {
+        // Capture the spec before the status update: `update_compaction`
+        // prunes finished entries, which may drop this one from the state.
+        let spec = self
+            .state()
+            .compactions()
+            .value
+            .get(&id)
+            .map(|c| c.spec().clone());
+        self.state_mut().update_compaction(&id, |c| {
+            c.set_status(CompactionStatus::Failed);
+            c.set_worker(None);
+        });
+        let Some(spec) = spec else {
+            return;
+        };
+        if !spec.has_l0_sources() {
+            return;
+        }
+        let Some(tree) = self.state().db_state().tree_for_segment(spec.segment()) else {
+            return;
+        };
+        let spec_l0s: HashSet<Ulid> = spec
+            .sources()
+            .iter()
+            .filter_map(|s| s.maybe_unwrap_sst_view())
+            .collect();
+        // The newest position (lowest index) among the failed spec's L0s. If
+        // none are present in the tree they were already absorbed (recovery
+        // case) and newer chunks are unaffected.
+        let Some(failed_newest) = tree.l0.iter().position(|view| spec_l0s.contains(&view.id))
+        else {
+            return;
+        };
+        let l0_pos: HashMap<Ulid, usize> = tree
+            .l0
+            .iter()
+            .enumerate()
+            .map(|(idx, view)| (view.id, idx))
+            .collect();
+        let to_fail: Vec<Ulid> = self
+            .state()
+            .compactions_with_status(&[
+                CompactionStatus::Submitted,
+                CompactionStatus::Scheduled,
+                CompactionStatus::Running,
+                CompactionStatus::Compacted,
+            ])
+            .filter(|c| c.id() != id && c.spec().segment() == spec.segment())
+            .filter(|c| {
+                // Newer means every L0 source sits strictly above (lower
+                // index than) the failed spec's newest L0.
+                let mut positions = c
+                    .spec()
+                    .sources()
+                    .iter()
+                    .filter_map(|s| s.maybe_unwrap_sst_view())
+                    .filter_map(|view_id| l0_pos.get(&view_id).copied())
+                    .peekable();
+                positions.peek().is_some() && positions.all(|pos| pos < failed_newest)
+            })
+            .map(|c| c.id())
+            .collect();
+        for newer_id in to_fail {
+            warn!(
+                "cascading failure to in-flight L0 compaction above a failed chunk \
+                 [failed_id={}, cascaded_id={}]",
+                id, newer_id
+            );
+            self.state_mut().update_compaction(&newer_id, |c| {
+                c.set_status(CompactionStatus::Failed);
+                c.set_worker(None);
+            });
+        }
     }
 
     /// Validates a Submitted compaction against the current manifest before starting it.
@@ -774,10 +995,11 @@ impl CompactorEventHandler {
     /// - Drain specs do not target the empty-prefix (root) segment
     /// - The target segment exists in the manifest
     /// - All sources exist in the target segment's tree
-    /// - L0-only tiered compactions have a destination > highest SR id across all trees
+    /// - L0-only tiered compactions have a destination > highest SR id in the target tree
     /// - A tiered destination does not overwrite a committed SR in any tree unless the SR is among sources
     /// - Drain L0 sources cover every L0 at or below the newest drained L0 in the target tree
-    /// - At most one L0 compaction is Running per segment
+    /// - L0-bearing specs pipeline safely with the segment's other in-flight L0
+    ///   compactions (see [`Self::validate_l0_pipelining`])
     /// - Scheduler-specific policy via [`CompactionScheduler::validate_compaction`]
     fn validate_compaction(&self, compaction: &CompactionSpec) -> Result<(), SlateDBError> {
         // Validate compaction sources exist
@@ -823,17 +1045,16 @@ impl CompactorEventHandler {
             return Err(SlateDBError::InvalidCompaction);
         }
 
-        // Validate L0-only compactions create a new SR with id > highest existing
-        // across all segment trees. SR ids are globally unique (RFC-0024) and the
-        // scheduler allocates new L0 → SR destinations strictly above the global
-        // max; admin- or reload-submitted specs must observe the same contract.
+        // Validate L0-only compactions create a new SR with id > the highest
+        // committed SR id in the target tree. The per-tree `compacted` list is
+        // ordered by descending id and that order must track data recency, so
+        // a fresh L0 → SR destination must sort above every SR already
+        // committed in the tree. Global id uniqueness is enforced separately:
+        // `validate_destination_overwrite` rejects collisions with committed
+        // SRs in any tree, and `add_compaction` rejects collisions with other
+        // active compactions' destinations.
         if compaction.has_l0_sources() && !compaction.has_sr_sources() {
-            let highest_id = db_state
-                .trees()
-                .flat_map(|t| t.compacted.iter())
-                .map(|sr| sr.id)
-                .max()
-                .map_or(0, |id| id + 1);
+            let highest_id = tree.compacted.iter().map(|sr| sr.id).max().map_or(0, |id| id + 1);
             // Drain specs have no destination and aren't subject to this check.
             if let Some(dst) = compaction.destination() {
                 if dst < highest_id {
@@ -849,32 +1070,141 @@ impl CompactorEventHandler {
         Self::validate_destination_overwrite(compaction, db_state)?;
         Self::validate_drain_watermark_advance(compaction, tree)?;
 
-        // Reject parallel L0 compactions within the same segment. Each
-        // segment owns its own `last_compacted_l0_sst_view_id` watermark
-        // (RFC-0024), so out-of-order completion is only a hazard for
-        // compactions sharing a target tree. L0 compactions in disjoint
-        // segments — including drain specs in different segments — are
-        // safe to run concurrently.
         if compaction.has_l0_sources() {
-            let target_segment = compaction.segment();
-            // Only Scheduled and Running represent live claims; Submitted is still
-            // being validated (and would see itself), Compacted is pending commit.
-            let active_l0_in_same_segment = self
-                .state()
-                .compactions_with_status(&[CompactionStatus::Scheduled, CompactionStatus::Running])
-                .any(|c| c.spec().has_l0_sources() && c.spec().segment() == target_segment);
-            if active_l0_in_same_segment {
-                warn!(
-                    "rejected compaction: parallel L0 compaction already active in segment {:?}",
-                    target_segment
-                );
-                return Err(SlateDBError::InvalidCompaction);
-            }
+            self.validate_l0_pipelining(compaction, tree)?;
         }
 
         self.scheduler
             .validate(&self.state().into(), compaction)
             .map_err(|_e| SlateDBError::InvalidCompaction)
+    }
+
+    /// Validates an L0-bearing spec against the other in-flight compactions in
+    /// its target segment, allowing parallel L0 compactions over disjoint
+    /// chunks of the L0 queue (RFC-0025).
+    ///
+    /// Each segment's `last_compacted_l0_sst_view_id` watermark is a single
+    /// scalar meaning "this L0 and everything older has been absorbed", so a
+    /// chunk may only *commit* once every older L0 is absorbed (see
+    /// [`Self::commit_compacted_entries`]). Parallel *execution* is safe as
+    /// long as the in-flight chunks can eventually commit oldest-first:
+    ///
+    /// - **No source overlap** with a `Scheduled`/`Running`/`Compacted`
+    ///   compaction in the segment — two compactions must never absorb the
+    ///   same source.
+    /// - **No interleaving**: the spec's L0 block must sit entirely newer or
+    ///   entirely older than every other in-flight L0 block, so the blocks
+    ///   commit as contiguous suffixes.
+    /// - **Destination follows recency**: between two in-flight tiered chunks,
+    ///   the chunk with newer L0s must have the higher destination SR id, so
+    ///   oldest-first commits keep the tree's `compacted` list ordered by
+    ///   recency.
+    /// - **No gaps**: every L0 older than the spec's newest L0 source must be
+    ///   covered by the spec itself or another in-flight compaction, so the
+    ///   commit-time watermark advance never eclipses an unabsorbed L0.
+    ///
+    /// `Submitted` siblings participate in the interleave/destination/coverage
+    /// checks (they are upcoming claims) but not the overlap check, and an
+    /// entry whose spec equals the one under validation is skipped — the spec
+    /// being validated is itself a `Submitted` entry in the state.
+    fn validate_l0_pipelining(
+        &self,
+        compaction: &CompactionSpec,
+        tree: &LsmTreeState,
+    ) -> Result<(), SlateDBError> {
+        // Position of each L0 view in the tree: index 0 is the newest.
+        let l0_pos: HashMap<Ulid, usize> = tree
+            .l0
+            .iter()
+            .enumerate()
+            .map(|(idx, view)| (view.id, idx))
+            .collect();
+        let spec_l0s: HashSet<Ulid> = compaction
+            .sources()
+            .iter()
+            .filter_map(|s| s.maybe_unwrap_sst_view())
+            .collect();
+        // Source existence was validated above, so every spec L0 has a position.
+        let spec_newest = spec_l0s.iter().map(|id| l0_pos[id]).min().unwrap_or(0);
+        let spec_oldest = spec_l0s.iter().map(|id| l0_pos[id]).max().unwrap_or(0);
+
+        let sources: HashSet<&SourceId> = compaction.sources().iter().collect();
+        let mut covered_l0s: HashSet<Ulid> = spec_l0s.clone();
+
+        let in_flight = self
+            .state()
+            .compactions_with_status(&[
+                CompactionStatus::Submitted,
+                CompactionStatus::Scheduled,
+                CompactionStatus::Running,
+                CompactionStatus::Compacted,
+            ])
+            .filter(|c| c.spec().segment() == compaction.segment())
+            .filter(|c| c.spec() != compaction);
+
+        for other in in_flight {
+            let other_spec = other.spec();
+            if !matches!(other.status(), CompactionStatus::Submitted)
+                && other_spec.sources().iter().any(|s| sources.contains(s))
+            {
+                warn!(
+                    "rejected compaction: sources overlap in-flight compaction [spec={}, in_flight={}]",
+                    compaction, other
+                );
+                return Err(SlateDBError::InvalidCompaction);
+            }
+            let other_l0_pos: Vec<usize> = other_spec
+                .sources()
+                .iter()
+                .filter_map(|s| s.maybe_unwrap_sst_view())
+                .inspect(|id| {
+                    covered_l0s.insert(*id);
+                })
+                .filter_map(|id| l0_pos.get(&id).copied())
+                .collect();
+            let (Some(&other_newest), Some(&other_oldest)) =
+                (other_l0_pos.iter().min(), other_l0_pos.iter().max())
+            else {
+                continue;
+            };
+            // Entirely newer (closer to index 0) or entirely older — never
+            // interleaved with the other compaction's L0 block.
+            let newer = spec_oldest < other_newest;
+            let older = spec_newest > other_oldest;
+            if !newer && !older {
+                warn!(
+                    "rejected compaction: L0 sources interleave in-flight compaction [spec={}, in_flight={}]",
+                    compaction, other
+                );
+                return Err(SlateDBError::InvalidCompaction);
+            }
+            if let (Some(dst), Some(other_dst)) =
+                (compaction.destination(), other_spec.destination())
+            {
+                if newer && dst <= other_dst || older && dst >= other_dst {
+                    warn!(
+                        "rejected compaction: destination SR id does not follow L0 recency \
+                         relative to in-flight compaction [spec={}, in_flight={}]",
+                        compaction, other
+                    );
+                    return Err(SlateDBError::InvalidCompaction);
+                }
+            }
+        }
+
+        // No gaps: every L0 older than the spec's newest L0 must be absorbed
+        // by this spec or an in-flight compaction before this spec commits.
+        for view in tree.l0.iter().skip(spec_newest) {
+            if !covered_l0s.contains(&view.id) {
+                warn!(
+                    "rejected compaction: L0 below the spec's newest source is not covered by \
+                     any in-flight compaction [spec={}, uncovered_l0={}]",
+                    compaction, view.id
+                );
+                return Err(SlateDBError::InvalidCompaction);
+            }
+        }
+        Ok(())
     }
 
     /// Rejects a tiered compaction whose destination SR id already exists as a
@@ -1023,15 +1353,25 @@ impl CompactorEventHandler {
         let any_drain = submitted_compactions.iter().any(|c| c.spec().is_drain());
 
         for compaction in &submitted_compactions {
+            // Skip entries that are no longer Submitted — a cascading failure
+            // earlier in this loop may have already failed this entry.
+            let current_status = self
+                .state()
+                .compactions()
+                .value
+                .get(&compaction.id())
+                .map(|c| c.status());
+            if current_status != Some(CompactionStatus::Submitted) {
+                continue;
+            }
+
             // Validate the candidate compaction; mark as failed if invalid.
             if let Err(e) = self.validate_compaction(compaction.spec()) {
                 error!(
                     "compaction validation failed [error={:?}, compaction={:?}]",
                     compaction, e
                 );
-                self.state_mut().update_compaction(&compaction.id(), |c| {
-                    c.set_status(CompactionStatus::Failed)
-                });
+                self.fail_compaction_cascading(compaction.id());
                 continue;
             }
 
@@ -5024,12 +5364,17 @@ mod tests {
         assert!(matches!(err, SlateDBError::InvalidCompaction));
     }
 
-    /// The L0-only monotonicity check is global across all segment trees, not
-    /// just the target tree. A spec whose destination is above the target
-    /// tree's local max but below the global max (an SR in some other
-    /// segment) must be rejected.
+    /// The L0-only monotonicity check is scoped to the target tree: only the
+    /// per-tree `compacted` list must stay ordered by recency. A spec whose
+    /// destination is above the target tree's local max is accepted even when
+    /// it sits below the global max (an SR in some other segment) — committed
+    /// SR ids in other trees impose no ordering on this tree, and id
+    /// uniqueness is enforced separately by `validate_destination_overwrite`
+    /// and `add_compaction`. Without the per-tree scope, parallel L0 chunks
+    /// in different segments would spuriously fail at commit whenever their
+    /// commit order inverted their allocation order.
     #[tokio::test]
-    async fn test_validate_compaction_l0_only_rejects_when_dest_below_global_highest_sr() {
+    async fn test_validate_compaction_l0_only_accepts_dest_above_local_but_below_global_max() {
         use crate::manifest::{LsmTreeState, Segment};
 
         let mut fixture = CompactorEventHandlerTestFixture::new().await;
@@ -5050,7 +5395,7 @@ mod tests {
             .value
             .core;
         // Root tree holds SR(7) — the global max. The segment-targeted spec
-        // below proposes dst=3, which is above the segment's local max (0)
+        // below proposes dst=3, which is above the segment's local max (none)
         // but below the global max.
         Arc::make_mut(&mut core.tree).compacted = vec![SortedRun {
             id: 7,
@@ -5067,8 +5412,7 @@ mod tests {
         }];
 
         let spec = CompactionSpec::for_segment(prefix, vec![SourceId::SstView(l0_view)], 3);
-        let err = fixture.handler.validate_compaction(&spec).unwrap_err();
-        assert!(matches!(err, SlateDBError::InvalidCompaction));
+        fixture.handler.validate_compaction(&spec).unwrap();
     }
 
     #[tokio::test]
@@ -5096,10 +5440,12 @@ mod tests {
         fixture.handler.validate_compaction(&mixed).unwrap();
     }
 
+    /// Disjoint L0 chunks in the same segment pipeline: a second chunk over
+    /// strictly newer L0s with a higher destination SR id validates while the
+    /// first chunk is still in flight (RFC-0025).
     #[tokio::test]
-    async fn test_validate_compaction_rejects_parallel_l0() {
+    async fn test_validate_compaction_allows_pipelined_l0_chunks() {
         let mut fixture = CompactorEventHandlerTestFixture::new().await;
-        // write two L0s so we can build two disjoint L0 compactions
         fixture.write_l0().await;
         fixture.write_l0().await;
         fixture.handler.handle_ticker().await.unwrap();
@@ -5107,19 +5453,146 @@ mod tests {
         let state = fixture.latest_db_state().await;
         assert!(state.tree.l0.len() >= 2);
 
-        // Build first L0 compaction from the oldest L0
+        // First chunk: the oldest L0. Inject and schedule it so it becomes active.
         let first_l0 =
             CompactionSpec::new(vec![SourceId::SstView(state.tree.l0.back().unwrap().id)], 0);
-        // Inject and schedule it so it becomes active
         fixture.scheduler.inject_compaction(first_l0.clone());
         fixture.handler.handle_ticker().await.unwrap();
 
-        // Build second L0 compaction from the newest L0 (disjoint sources)
+        // Second chunk: the newest L0 (disjoint, newer, higher destination).
         let second_l0 = CompactionSpec::new(
             vec![SourceId::SstView(state.tree.l0.front().unwrap().id)],
             1,
         );
+        fixture.handler.validate_compaction(&second_l0).unwrap();
+    }
+
+    /// A spec sharing a source with an in-flight compaction in the same
+    /// segment is rejected: two compactions must never absorb the same L0.
+    #[tokio::test]
+    async fn test_validate_compaction_rejects_overlapping_l0_chunks() {
+        let mut fixture = CompactorEventHandlerTestFixture::new().await;
+        fixture.write_l0().await;
+        fixture.write_l0().await;
+        fixture.handler.handle_ticker().await.unwrap();
+
+        let state = fixture.latest_db_state().await;
+        let oldest = state.tree.l0.back().unwrap().id;
+
+        let first_l0 = CompactionSpec::new(vec![SourceId::SstView(oldest)], 0);
+        fixture.scheduler.inject_compaction(first_l0.clone());
+        fixture.handler.handle_ticker().await.unwrap();
+
+        // Second spec re-uses the in-flight oldest L0.
+        let overlapping = CompactionSpec::new(
+            vec![
+                SourceId::SstView(state.tree.l0.front().unwrap().id),
+                SourceId::SstView(oldest),
+            ],
+            1,
+        );
+        let err = fixture
+            .handler
+            .validate_compaction(&overlapping)
+            .unwrap_err();
+        assert!(matches!(err, SlateDBError::InvalidCompaction));
+    }
+
+    /// A newer chunk must take a higher destination SR id than an in-flight
+    /// older chunk; committing oldest-first must keep the tree's `compacted`
+    /// list ordered by recency.
+    #[tokio::test]
+    async fn test_validate_compaction_rejects_l0_chunk_with_unordered_destination() {
+        let mut fixture = CompactorEventHandlerTestFixture::new().await;
+        fixture.write_l0().await;
+        fixture.write_l0().await;
+        fixture.handler.handle_ticker().await.unwrap();
+
+        let state = fixture.latest_db_state().await;
+
+        let first_l0 =
+            CompactionSpec::new(vec![SourceId::SstView(state.tree.l0.back().unwrap().id)], 5);
+        fixture.scheduler.inject_compaction(first_l0.clone());
+        fixture.handler.handle_ticker().await.unwrap();
+
+        // Newer chunk with a destination below the in-flight older chunk's.
+        let second_l0 = CompactionSpec::new(
+            vec![SourceId::SstView(state.tree.l0.front().unwrap().id)],
+            3,
+        );
         let err = fixture.handler.validate_compaction(&second_l0).unwrap_err();
+        assert!(matches!(err, SlateDBError::InvalidCompaction));
+    }
+
+    /// A spec whose L0 block interleaves an in-flight compaction's block is
+    /// rejected: chunks must commit as contiguous suffixes of the L0 queue.
+    #[tokio::test]
+    async fn test_validate_compaction_rejects_interleaved_l0_chunks() {
+        let mut fixture = CompactorEventHandlerTestFixture::new().await;
+        fixture.write_l0().await;
+        fixture.write_l0().await;
+        fixture.write_l0().await;
+        fixture.handler.state_writer.refresh().await.unwrap();
+
+        let state = fixture.latest_db_state().await;
+        assert!(state.tree.l0.len() >= 3);
+        let newest = state.tree.l0[0].id;
+        let middle = state.tree.l0[1].id;
+        let oldest = state.tree.l0[2].id;
+
+        // Seed a Running compaction over the middle L0 only.
+        let running_spec = CompactionSpec::new(vec![SourceId::SstView(middle)], 7);
+        fixture
+            .handler
+            .state_writer
+            .state
+            .insert_compaction_for_test(
+                Compaction::new(Ulid::from_parts(100, 0), running_spec)
+                    .with_status(CompactionStatus::Running),
+            );
+
+        // The spec's block [newest, oldest] straddles the in-flight middle L0.
+        let interleaved = CompactionSpec::new(
+            vec![SourceId::SstView(newest), SourceId::SstView(oldest)],
+            8,
+        );
+        let err = fixture
+            .handler
+            .validate_compaction(&interleaved)
+            .unwrap_err();
+        assert!(matches!(err, SlateDBError::InvalidCompaction));
+    }
+
+    /// A spec leaving an older L0 uncovered — neither among its own sources
+    /// nor claimed by any in-flight compaction — is rejected: committing it
+    /// would advance the watermark over an unabsorbed L0.
+    #[tokio::test]
+    async fn test_validate_compaction_rejects_l0_chunk_with_gap() {
+        let mut fixture = CompactorEventHandlerTestFixture::new().await;
+        fixture.write_l0().await;
+        fixture.write_l0().await;
+        fixture.write_l0().await;
+        fixture.handler.state_writer.refresh().await.unwrap();
+
+        let state = fixture.latest_db_state().await;
+        assert!(state.tree.l0.len() >= 3);
+        let newest = state.tree.l0[0].id;
+        let oldest = state.tree.l0[2].id;
+
+        // Seed a Running compaction over the oldest L0 only.
+        let running_spec = CompactionSpec::new(vec![SourceId::SstView(oldest)], 7);
+        fixture
+            .handler
+            .state_writer
+            .state
+            .insert_compaction_for_test(
+                Compaction::new(Ulid::from_parts(100, 0), running_spec)
+                    .with_status(CompactionStatus::Running),
+            );
+
+        // The middle L0 is uncovered: not in the spec, not in flight.
+        let gappy = CompactionSpec::new(vec![SourceId::SstView(newest)], 8);
+        let err = fixture.handler.validate_compaction(&gappy).unwrap_err();
         assert!(matches!(err, SlateDBError::InvalidCompaction));
     }
 
