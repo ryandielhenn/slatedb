@@ -137,6 +137,12 @@ impl BackpressureChecker {
 struct TreeState {
     prefix: Bytes,
     l0: Vec<CompactionSource>,
+    /// L0 views already reserved by active or newly proposed L0 compactions.
+    ///
+    /// L0 is ordered newest → oldest. Reservations must form a suffix so the
+    /// scheduler can reserve the next older-to-newer batch without allowing a
+    /// later batch to overtake an earlier watermark update at commit time.
+    reserved_l0: HashSet<SourceId>,
     srs: Vec<CompactionSource>,
     conflicts: ConflictChecker,
     bp: BackpressureChecker,
@@ -150,6 +156,36 @@ impl TreeState {
         next_sr: Option<&CompactionSource>,
     ) -> bool {
         self.conflicts.check_compaction(sources, dst) && self.bp.check_compaction(sources, next_sr)
+    }
+
+    /// Returns the unreserved L0 prefix. If existing reservations are not an
+    /// oldest-L0 suffix, no additional L0 work is proposed for this tree: the
+    /// compactor cannot safely infer a watermark commit order from that state.
+    fn available_l0_prefix(&self) -> Option<VecDeque<CompactionSource>> {
+        let first_reserved = self
+            .l0
+            .iter()
+            .position(|source| self.reserved_l0.contains(&source.source))
+            .unwrap_or(self.l0.len());
+        if self
+            .l0
+            .iter()
+            .skip(first_reserved)
+            .any(|source| !self.reserved_l0.contains(&source.source))
+        {
+            return None;
+        }
+        Some(self.l0[..first_reserved].iter().copied().collect())
+    }
+
+    fn reserve_l0_sources(&mut self, compaction: &CompactionSpec) {
+        self.reserved_l0.extend(
+            compaction
+                .sources()
+                .iter()
+                .filter(|source| matches!(source, SourceId::SstView(_)))
+                .copied(),
+        );
     }
 }
 
@@ -205,6 +241,14 @@ impl CompactionScheduler for SizeTieredCompactionScheduler {
             .trees_with_prefix()
             .map(|(prefix, tree)| {
                 let (l0, srs) = compaction_sources(tree);
+                let reserved_l0 = active_by_segment
+                    .get(&prefix)
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|compaction| compaction.sources().iter())
+                    .filter(|source| matches!(source, SourceId::SstView(_)))
+                    .copied()
+                    .collect();
                 let conflicts = ConflictChecker::new(
                     active_by_segment
                         .get(&prefix)
@@ -220,6 +264,7 @@ impl CompactionScheduler for SizeTieredCompactionScheduler {
                 TreeState {
                     prefix,
                     l0,
+                    reserved_l0,
                     srs,
                     conflicts,
                     bp,
@@ -239,6 +284,9 @@ impl CompactionScheduler for SizeTieredCompactionScheduler {
                     break;
                 }
                 if let Some(compaction) = self.pick_next_compaction(tree, &mut next_fresh_sr_id) {
+                    if compaction.has_l0_sources() {
+                        tree.reserve_l0_sources(&compaction);
+                    }
                     tree.conflicts.add_compaction(&compaction);
                     compactions.push(compaction);
                     picked_any = true;
@@ -334,16 +382,17 @@ impl SizeTieredCompactionScheduler {
         next_fresh_sr_id: &mut u32,
     ) -> Option<CompactionSpec> {
         // compact l0s if required
-        let l0_candidates: VecDeque<_> = tree.l0.iter().copied().collect();
-        if let Some(mut l0_candidates) = self.clamp_min(l0_candidates) {
-            l0_candidates = self.clamp_max(l0_candidates);
-            // SR ids are globally unique (RFC-0024), so the fresh-id counter
-            // must come from `next_global_sr_id` rather than this tree alone.
-            let dst = *next_fresh_sr_id;
-            let next_sr = tree.srs.first();
-            if tree.check_compaction(&l0_candidates, dst, next_sr) {
-                *next_fresh_sr_id = next_fresh_sr_id.saturating_add(1);
-                return Some(self.create_compaction(&tree.prefix, l0_candidates, dst));
+        if let Some(l0_candidates) = tree.available_l0_prefix() {
+            if let Some(mut l0_candidates) = self.clamp_min(l0_candidates) {
+                l0_candidates = self.clamp_max(l0_candidates);
+                // SR ids are globally unique (RFC-0024), so the fresh-id counter
+                // must come from `next_global_sr_id` rather than this tree alone.
+                let dst = *next_fresh_sr_id;
+                let next_sr = tree.srs.first();
+                if tree.check_compaction(&l0_candidates, dst, next_sr) {
+                    *next_fresh_sr_id = next_fresh_sr_id.saturating_add(1);
+                    return Some(self.create_compaction(&tree.prefix, l0_candidates, dst));
+                }
             }
         }
 
@@ -594,6 +643,63 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let request = requests.first().unwrap();
         assert_eq!(request.destination(), Some(11));
+    }
+
+    #[test]
+    fn test_should_propose_disjoint_l0_batches_oldest_first() {
+        let scheduler = SizeTieredCompactionScheduler::new(
+            SizeTieredCompactionSchedulerOptions {
+                min_compaction_sources: 2,
+                max_compaction_sources: 2,
+                ..Default::default()
+            },
+            3,
+        );
+        // L0 order is newest → oldest. The scheduler reserves the oldest
+        // batch first so the coordinator can publish watermarks in the same
+        // order even if workers finish these jobs out of order.
+        let l0 = [
+            create_sst_view(1),
+            create_sst_view(1),
+            create_sst_view(1),
+            create_sst_view(1),
+            create_sst_view(1),
+            create_sst_view(1),
+        ];
+        let state =
+            &create_compactor_state(create_db_state(l0.iter().cloned().collect(), Vec::new()));
+
+        let requests = scheduler.propose(&state.into());
+
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests[0].sources(),
+            &l0[4..]
+                .iter()
+                .map(|view| SourceId::SstView(view.id))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            requests[1].sources(),
+            &l0[2..4]
+                .iter()
+                .map(|view| SourceId::SstView(view.id))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            requests[2].sources(),
+            &l0[..2]
+                .iter()
+                .map(|view| SourceId::SstView(view.id))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.destination())
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(1), Some(2)]
+        );
     }
 
     #[test]

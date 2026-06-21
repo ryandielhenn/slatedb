@@ -854,19 +854,28 @@ impl CompactorEventHandler {
     ///   already in the correct post-compaction state, so marking `Failed` has no
     ///   effect on correctness.
     async fn commit_compacted_entries(&mut self) -> Result<(), SlateDBError> {
-        let compacted = self
+        let mut remaining = self
             .state()
             .compactions_with_status(&[CompactionStatus::Compacted])
             .cloned()
             .collect::<Vec<_>>();
 
-        if compacted.is_empty() {
+        if remaining.is_empty() {
             return Ok(());
         }
 
-        for compaction in compacted {
+        // A same-segment L0 job may finish execution before an older L0 job.
+        // Its output is intentionally retained in `.compactions` until every
+        // older queued batch has committed and advanced the watermark. Other
+        // independent compactions can still commit in this pass.
+        let mut state_changed = false;
+        while let Some(index) = remaining
+            .iter()
+            .position(|compaction| self.is_l0_commit_head(compaction))
+        {
+            let compaction = remaining.remove(index);
             let id = compaction.id();
-            match self.validate_compaction(compaction.spec()) {
+            match self.validate_compaction_for(Some(compaction.id()), compaction.spec()) {
                 Ok(()) => {
                     let destination = compaction
                         .spec()
@@ -881,6 +890,7 @@ impl CompactorEventHandler {
                             .collect(),
                     };
                     self.state_mut().finish_compaction(id, output_sr);
+                    state_changed = true;
                     self.stats
                         .last_compaction_ts
                         .set(self.system_clock.now().timestamp());
@@ -894,8 +904,13 @@ impl CompactorEventHandler {
                     );
                     self.state_mut()
                         .update_compaction(&id, |c| c.set_status(CompactionStatus::Failed));
+                    state_changed = true;
                 }
             }
+        }
+
+        if !state_changed {
+            return Ok(());
         }
 
         self.log_compaction_state();
@@ -904,13 +919,55 @@ impl CompactorEventHandler {
         Ok(())
     }
 
+    /// True if `compaction` is the oldest active L0 batch for its segment.
+    ///
+    /// L0 is stored newest → oldest. A compaction's first position in that
+    /// list is the newest view it owns, so a larger position belongs to an
+    /// older batch and must publish first. This is a commit-order rule only:
+    /// workers are free to execute batches in any order.
+    fn is_l0_commit_head(&self, compaction: &Compaction) -> bool {
+        let spec = compaction.spec();
+        if spec.is_drain() || !spec.has_l0_sources() {
+            return true;
+        }
+        let Some(tree) = self.state().db_state().tree_for_segment(spec.segment()) else {
+            return false;
+        };
+        let Some(candidate_index) = Self::newest_l0_source_index(tree, spec) else {
+            // Let normal validation mark a stale Compacted entry as Failed.
+            // Blocking it here would leave recovery entries permanently stuck.
+            return true;
+        };
+
+        self.state()
+            .active_compactions()
+            .filter(|other| {
+                other.id() != compaction.id()
+                    && !other.spec().is_drain()
+                    && other.spec().has_l0_sources()
+                    && other.spec().segment() == spec.segment()
+            })
+            .all(|other| {
+                Self::newest_l0_source_index(tree, other.spec())
+                    .is_some_and(|other_index| other_index <= candidate_index)
+            })
+    }
+
+    fn newest_l0_source_index(tree: &LsmTreeState, spec: &CompactionSpec) -> Option<usize> {
+        tree.l0.iter().position(|view| {
+            spec.sources()
+                .iter()
+                .any(|source| source.maybe_unwrap_sst_view() == Some(view.id))
+        })
+    }
+
     /// Validates a Submitted compaction against the current manifest before starting it.
     ///
     /// Runs on every Submitted spec regardless of origin (internal scheduler, admin
     /// submission, reloaded `.compactions`), so this is the canonical gate for
-    /// spec-against-current-state validity. Cross-compaction conflicts (destination
-    /// collisions across active compactions, concurrent drains on the same segment) are
-    /// enforced upstream in [`CompactorState::add_compaction`] and are not re-checked here.
+    /// spec-against-current-state validity. Admission also rejects any source
+    /// conflict already visible in local state; this catches conflicting
+    /// submissions that arrived through a remote `.compactions` refresh.
     ///
     /// Invariants checked:
     /// - Compaction has sources
@@ -920,12 +977,48 @@ impl CompactorEventHandler {
     /// - L0-only tiered compactions have a destination > highest SR id across all trees
     /// - A tiered destination does not overwrite a committed SR in any tree unless the SR is among sources
     /// - Drain L0 sources cover every L0 at or below the newest drained L0 in the target tree
-    /// - At most one L0 compaction is Running per segment
+    /// - Active L0 compactions reserve disjoint, contiguous oldest-L0 batches
+    ///   per segment so their results can be committed in watermark order
     /// - Scheduler-specific policy via [`CompactionScheduler::validate_compaction`]
+    #[cfg(test)]
     fn validate_compaction(&self, compaction: &CompactionSpec) -> Result<(), SlateDBError> {
+        self.validate_compaction_for(None, compaction)
+    }
+
+    /// Validates a compaction while optionally excluding its own active entry
+    /// from source-conflict checks.
+    fn validate_compaction_for(
+        &self,
+        compaction_id: Option<Ulid>,
+        compaction: &CompactionSpec,
+    ) -> Result<(), SlateDBError> {
         // Validate compaction sources exist
         if compaction.sources().is_empty() {
             warn!("submitted compaction is empty: {:?}", compaction.sources());
+            return Err(SlateDBError::InvalidCompaction);
+        }
+
+        if compaction.sources().iter().any(|source| {
+            self.state().active_compactions().any(|active| {
+                Some(active.id()) != compaction_id && active.spec().sources().contains(source)
+            })
+        }) {
+            warn!(
+                "compaction source is already owned by an active compaction: {:?}",
+                compaction.sources()
+            );
+            return Err(SlateDBError::InvalidCompaction);
+        }
+
+        if self.state().active_compactions().any(|active| {
+            Some(active.id()) != compaction_id
+                && active.spec().segment() == compaction.segment()
+                && (compaction.is_drain() || active.spec().is_drain())
+        }) {
+            warn!(
+                "drain compaction cannot run concurrently with other work in segment {:?}",
+                compaction.segment()
+            );
             return Err(SlateDBError::InvalidCompaction);
         }
 
@@ -991,33 +1084,126 @@ impl CompactorEventHandler {
 
         Self::validate_destination_overwrite(compaction, db_state)?;
         Self::validate_drain_watermark_advance(compaction, tree)?;
-
-        // Reject parallel L0 compactions within the same segment. Each
-        // segment owns its own `last_compacted_l0_sst_view_id` watermark
-        // (RFC-0024), so out-of-order completion is only a hazard for
-        // compactions sharing a target tree. L0 compactions in disjoint
-        // segments — including drain specs in different segments — are
-        // safe to run concurrently.
-        if compaction.has_l0_sources() {
-            let target_segment = compaction.segment();
-            // Only Scheduled and Running represent live claims; Submitted is still
-            // being validated (and would see itself), Compacted is pending commit.
-            let active_l0_in_same_segment = self
-                .state()
-                .compactions_with_status(&[CompactionStatus::Scheduled, CompactionStatus::Running])
-                .any(|c| c.spec().has_l0_sources() && c.spec().segment() == target_segment);
-            if active_l0_in_same_segment {
-                warn!(
-                    "rejected compaction: parallel L0 compaction already active in segment {:?}",
-                    target_segment
-                );
-                return Err(SlateDBError::InvalidCompaction);
-            }
-        }
+        self.validate_l0_commit_queue(compaction, tree)?;
 
         self.scheduler
             .validate(&self.state().into(), compaction)
             .map_err(|_e| SlateDBError::InvalidCompaction)
+    }
+
+    /// Validates the per-segment L0 publication queue.
+    ///
+    /// Multiple L0 batches may execute concurrently, but the union of every
+    /// active batch must be an oldest-L0 suffix. The coordinator publishes
+    /// that suffix from oldest to newest; each watermark therefore removes
+    /// exactly the batch it has committed and no input owned by a later job.
+    fn validate_l0_commit_queue(
+        &self,
+        compaction: &CompactionSpec,
+        tree: &LsmTreeState,
+    ) -> Result<(), SlateDBError> {
+        if compaction.is_drain() || !compaction.has_l0_sources() {
+            return Ok(());
+        }
+
+        let compaction_l0s: HashSet<Ulid> = compaction
+            .sources()
+            .iter()
+            .filter_map(|source| source.maybe_unwrap_sst_view())
+            .collect();
+        let Some(first_compaction_l0) = tree
+            .l0
+            .iter()
+            .position(|view| compaction_l0s.contains(&view.id))
+        else {
+            return Err(SlateDBError::InvalidCompaction);
+        };
+        let last_compaction_l0 = tree
+            .l0
+            .iter()
+            .rposition(|view| compaction_l0s.contains(&view.id))
+            .expect("first matching L0 must have a last match");
+        if tree.l0.iter().enumerate().any(|(index, view)| {
+            (first_compaction_l0..=last_compaction_l0).contains(&index)
+                && !compaction_l0s.contains(&view.id)
+        }) {
+            warn!(
+                "L0 compaction sources are not contiguous: segment={:?}, sources={:?}",
+                compaction.segment(),
+                compaction.sources()
+            );
+            return Err(SlateDBError::InvalidCompaction);
+        }
+
+        let mut reserved_l0s = compaction_l0s;
+        reserved_l0s.extend(
+            self.state()
+                .active_compactions()
+                .filter(|active| {
+                    !active.spec().is_drain()
+                        && active.spec().has_l0_sources()
+                        && active.spec().segment() == compaction.segment()
+                })
+                .flat_map(|active| active.spec().sources().iter())
+                .filter_map(|source| source.maybe_unwrap_sst_view()),
+        );
+        let Some(first_reserved_l0) = tree
+            .l0
+            .iter()
+            .position(|view| reserved_l0s.contains(&view.id))
+        else {
+            return Err(SlateDBError::InvalidCompaction);
+        };
+        if tree
+            .l0
+            .iter()
+            .skip(first_reserved_l0)
+            .any(|view| !reserved_l0s.contains(&view.id))
+        {
+            warn!(
+                "active L0 compactions do not reserve an oldest-L0 suffix: segment={:?}",
+                compaction.segment()
+            );
+            return Err(SlateDBError::InvalidCompaction);
+        }
+
+        // Sorted-run ids encode recency. Since the queue publishes older L0
+        // batches first, a newer batch (smaller L0 index) must own a larger
+        // destination id than every older batch already in the queue.
+        let destination = compaction
+            .destination()
+            .expect("non-drain L0 compaction must have a destination");
+        for active in self.state().active_compactions().filter(|active| {
+            !active.spec().is_drain()
+                && active.spec().has_l0_sources()
+                && active.spec().segment() == compaction.segment()
+                && active.spec() != compaction
+        }) {
+            let Some(active_first_l0) = Self::newest_l0_source_index(tree, active.spec()) else {
+                continue;
+            };
+            let active_destination = active
+                .spec()
+                .destination()
+                .expect("non-drain L0 compaction must have a destination");
+            let destination_is_ordered = if first_compaction_l0 < active_first_l0 {
+                destination > active_destination
+            } else if first_compaction_l0 > active_first_l0 {
+                destination < active_destination
+            } else {
+                false
+            };
+            if !destination_is_ordered {
+                warn!(
+                    "L0 compaction destinations do not match watermark order: segment={:?}, destination={}, active_destination={}",
+                    compaction.segment(),
+                    destination,
+                    active_destination
+                );
+                return Err(SlateDBError::InvalidCompaction);
+            }
+        }
+        Ok(())
     }
 
     /// Rejects a tiered compaction whose destination SR id already exists as a
@@ -1167,7 +1353,7 @@ impl CompactorEventHandler {
 
         for compaction in &submitted_compactions {
             // Validate the candidate compaction; mark as failed if invalid.
-            if let Err(e) = self.validate_compaction(compaction.spec()) {
+            if let Err(e) = self.validate_compaction_for(Some(compaction.id()), compaction.spec()) {
                 error!(
                     "compaction validation failed [error={:?}, compaction={:?}]",
                     compaction, e
@@ -4812,6 +4998,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_commits_parallel_l0_batches_in_watermark_order() {
+        let mut fixture = CompactorEventHandlerTestFixture::new().await;
+        for _ in 0..4 {
+            fixture.write_l0().await;
+        }
+        fixture.handler.state_writer.refresh().await.unwrap();
+        let state = fixture.handler.state().db_state().clone();
+        assert_eq!(state.tree.l0.len(), 4);
+
+        // L0 order is newest → oldest. Give the newer batch the lower
+        // compaction ULID so `.compactions` iteration encounters it first;
+        // the coordinator must nevertheless commit the older batch first.
+        let newer_sources = state
+            .tree
+            .l0
+            .iter()
+            .take(2)
+            .map(|view| SourceId::SstView(view.id));
+        let older_sources = state
+            .tree
+            .l0
+            .iter()
+            .skip(2)
+            .map(|view| SourceId::SstView(view.id));
+        let newer_spec = CompactionSpec::new(newer_sources.collect(), 1);
+        let older_spec = CompactionSpec::new(older_sources.collect(), 0);
+        let newer_id = Ulid::from_parts(1, 0);
+        let older_id = Ulid::from_parts(2, 0);
+        let output = |id| {
+            vec![
+                Subcompaction::new(BytesRange::unbounded()).with_output_ssts(vec![
+                    SsTableHandle::new(
+                        SsTableId::Compacted(id),
+                        SST_FORMAT_VERSION_LATEST,
+                        SsTableInfo {
+                            first_entry: Some(Bytes::from_static(b"a")),
+                            last_entry: Some(Bytes::from_static(b"z")),
+                            ..Default::default()
+                        },
+                    ),
+                ]),
+            ]
+        };
+
+        fixture
+            .handler
+            .state_mut()
+            .add_compaction(
+                Compaction::new(newer_id, newer_spec.clone())
+                    .with_status(CompactionStatus::Compacted)
+                    .with_subcompactions(output(Ulid::from_parts(101, 0))),
+            )
+            .unwrap();
+        fixture
+            .handler
+            .state_mut()
+            .add_compaction(
+                Compaction::new(older_id, older_spec.clone())
+                    .with_status(CompactionStatus::Running),
+            )
+            .unwrap();
+
+        // The newer batch has completed, but it cannot publish until the
+        // older batch has also completed.
+        fixture.handler.commit_compacted_entries().await.unwrap();
+        assert_eq!(
+            fixture
+                .handler
+                .state()
+                .compactions()
+                .value
+                .get(&newer_id)
+                .unwrap()
+                .status(),
+            CompactionStatus::Compacted
+        );
+        assert_eq!(fixture.handler.state().db_state().tree.l0.len(), 4);
+
+        fixture
+            .handler
+            .state_mut()
+            .update_compaction(&older_id, |compaction| {
+                compaction.set_subcompactions(output(Ulid::from_parts(102, 0)));
+                compaction.set_status(CompactionStatus::Compacted);
+            });
+        fixture.handler.commit_compacted_entries().await.unwrap();
+
+        let state = fixture.latest_db_state().await;
+        assert!(state.tree.l0.is_empty());
+        assert_eq!(
+            state.tree.last_compacted_l0_sst_view_id,
+            newer_spec
+                .sources()
+                .first()
+                .and_then(|source| source.maybe_unwrap_sst_view())
+        );
+        assert_eq!(
+            state
+                .tree
+                .compacted
+                .iter()
+                .map(|run| run.id)
+                .collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+    }
+
+    #[tokio::test]
     async fn test_should_persist_compactions_on_start_and_finish() {
         // given:
         let mut fixture = CompactorEventHandlerTestFixture::new().await;
@@ -5374,7 +5668,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_validate_compaction_rejects_parallel_l0() {
+    async fn test_validate_compaction_allows_ordered_parallel_l0() {
         let mut fixture = CompactorEventHandlerTestFixture::new().await;
         // write two L0s so we can build two disjoint L0 compactions
         fixture.write_l0().await;
@@ -5396,14 +5690,14 @@ mod tests {
             vec![SourceId::SstView(state.tree.l0.front().unwrap().id)],
             1,
         );
-        let err = fixture.handler.validate_compaction(&second_l0).unwrap_err();
-        assert!(matches!(err, SlateDBError::InvalidCompaction));
+        fixture
+            .handler
+            .validate_compaction(&second_l0)
+            .expect("disjoint L0 batches in watermark order must be allowed");
     }
 
     /// L0 compactions in disjoint segments may run concurrently — each segment
     /// owns its own watermark, so cross-segment parallelism is safe (RFC-0024).
-    /// The parallel-L0 rejection in `validate_compaction` must scope itself to
-    /// the spec's target segment.
     ///
     /// This test inspects `validate_compaction` directly by seeding the
     /// compactor's local state with two segments and a Running spec — going
@@ -5471,12 +5765,14 @@ mod tests {
             .validate_compaction(&spec_b)
             .expect("L0 in disjoint segment must be allowed");
 
-        // Sanity check: a second L0 spec in the SAME segment is still rejected.
+        // Duplicate L0 ownership in the same segment is rejected when the
+        // coordinator admits the second compaction.
         let spec_a_dup =
             CompactionSpec::for_segment(prefix_a.clone(), vec![SourceId::SstView(l0_a)], 202);
         let err = fixture
             .handler
-            .validate_compaction(&spec_a_dup)
+            .state_mut()
+            .add_compaction(Compaction::new(Ulid::from_parts(101, 0), spec_a_dup))
             .unwrap_err();
         assert!(matches!(err, SlateDBError::InvalidCompaction));
     }

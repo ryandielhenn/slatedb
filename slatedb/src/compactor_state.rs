@@ -896,16 +896,24 @@ impl CompactorState {
     ///   conflicts with another active compaction.
     pub(crate) fn add_compaction(&mut self, compaction: Compaction) -> Result<(), SlateDBError> {
         let spec = compaction.spec();
-        // At most one active drain per segment. Drain specs have no destination, so the
-        // destination-collision check below cannot catch duplicates; an explicit
-        // per-segment guard does.
-        if spec.is_drain()
-            && self
-                .compactions
+        // Compactions may execute concurrently, but no input can be owned by
+        // two active jobs. In particular, parallel L0 batches must be
+        // disjoint so the coordinator can publish them in watermark order.
+        if spec.sources().iter().any(|source| {
+            self.compactions
                 .value
                 .iter_active()
-                .any(|c| c.spec().is_drain() && c.spec().segment() == spec.segment())
-        {
+                .any(|c| c.spec().sources().contains(source))
+        }) {
+            return Err(SlateDBError::InvalidCompaction);
+        }
+        // Drain compactions mutate a segment's watermark and compacted runs
+        // without producing an output run. Keep them exclusive with all work
+        // in their segment; only tiered L0 batches participate in the ordered
+        // parallel-publication queue.
+        if self.compactions.value.iter_active().any(|c| {
+            c.spec().segment() == spec.segment() && (spec.is_drain() || c.spec().is_drain())
+        }) {
             return Err(SlateDBError::InvalidCompaction);
         }
         // SR ids are globally unique across all segment trees (RFC-0024), so destination
